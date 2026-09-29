@@ -34,6 +34,10 @@ Birnbaum 重要度（`P(top | 强制该事件=1) − P(top | 强制该事件=0)`
 还提供模板实例化展开接口 `POST /v1/expand-model`：给定 1～8 个可复用模板（各含参数、门、
 子实例与 `top`）与一个根实例（根参数绑定到事件），递归展开全部子实例，返回门名为
 `root/实例路径/门名` 的扁平故障树，可直接提交给 `/v1/analyze`。
+以及概率区间风险判定接口 `POST /v1/interval-risk`：在 `events` / `gates` / `top` 之外另收
+1～8 个事件到 `{low, high}` 概率区间的映射与阈值 `limit`，求区间事件概率在各自区间内独立
+变化时顶事件概率的最小值、最大值及对应的区间端点取值，并按 `max≤limit` 为 `safe`、
+`min>limit` 为 `unsafe`、其余为 `uncertain` 给出风险判定。
 
 ## 快速启动（Docker Compose）
 
@@ -55,6 +59,7 @@ docker compose up --build
 - 首次故障时间接口：`http://localhost:8000/v1/first-failure-time`
 - 观测冲突定位接口：`http://localhost:8000/v1/observation-conflicts`
 - 模板实例化展开接口：`http://localhost:8000/v1/expand-model`
+- 概率区间风险判定接口：`http://localhost:8000/v1/interval-risk`
 - 健康检查：`http://localhost:8000/health`
 - 交互式文档（Swagger UI）：`http://localhost:8000/docs`
 
@@ -935,6 +940,94 @@ curl -s -X POST http://localhost:8000/v1/expand-model \
 { "detail": "展开后门数超过 64 个上限：仅根实例触达的模板按调用关系实例化后的门数即已超过 64（根模板 'Root' 的展开门数至少为 65）；判定基于模板调用图统计，未遍历具体实例树" }
 ```
 
+## 概率区间风险判定示例（POST /v1/interval-risk）
+
+在 `events` / `gates` / `top`（校验规则与 `/v1/analyze` 完全一致，`AND`/`OR`/`NOT` 均可）
+之外另收两个字段：
+
+- `intervals`：**1～8** 个**事件 id** 到区间端点的映射，每项含 `low`、`high` 两个 `n/d`
+  概率字符串，且必须满足 **`low ≤ 原 p ≤ high`**。区间事件的发生概率不再固定，而可在
+  `[low, high]` 内**相互独立**地变化；未列入 `intervals` 的事件保持原 `p`。同一事件的
+  多处引用共享同一个概率变量，`NOT` 门照常生效。
+- `limit`：风险判定阈值，`n/d` 形式的合法概率（`0≤n≤d≤10^6`）。
+
+响应给出：
+
+- `min_probability` / `max_probability`：区间事件概率独立变化时，顶事件概率的最小值与
+  最大值，均为约分 `n/d`；
+- `min_endpoints` / `max_endpoints`：各自取得最值时，**每个区间事件实际取的端点值**
+  （即该事件的 `low` 或 `high`，约分 `n/d`），按事件 id 字典序排列；
+- `verdict`：**`max_probability ≤ limit` 为 `safe`，`min_probability > limit` 为 `unsafe`，
+  其余为 `uncertain`**（边界：`max == limit` 算 `safe`，`min == limit` 算 `uncertain`）。
+
+顶事件概率是各区间事件概率的多线性多项式，其在超盒上的最值必在端点组合处取得；服务在
+故障树 ROBDD 上自底向上求出该多项式，再对全部 `2^k ≤ 256` 个端点组合精确求值
+（`k ≤ 8`），**不枚举事件状态**，也不新增 BDD 节点。多个端点组合并列取得同一最值时，
+按**事件 id 字典序**比较端点、**`low` 优先**取唯一组合。
+
+仍以电机冷却系统为例：给 `coolant_loss`、`pump_fail` 分别指定概率区间，阈值取 `1/20`：
+
+```bash
+curl -X POST http://localhost:8000/v1/interval-risk \
+  -H "Content-Type: application/json" \
+  -d '{
+    "events": [
+      {"id": "motor_overheat", "p": "1/100"},
+      {"id": "coolant_loss",  "p": "2/100"},
+      {"id": "pump_fail",     "p": "1/200"}
+    ],
+    "gates": [
+      {"id": "cooling_fail", "op": "OR",
+       "inputs": ["coolant_loss", "pump_fail"]},
+      {"id": "top", "op": "OR",
+       "inputs": ["motor_overheat", "cooling_fail"]}
+    ],
+    "top": "top",
+    "intervals": {
+      "coolant_loss": {"low": "0/1", "high": "5/100"},
+      "pump_fail":     {"low": "0/1", "high": "1/100"}
+    },
+    "limit": "1/20"
+  }'
+```
+
+响应：
+
+```json
+{
+  "min_probability": "1/100",
+  "max_probability": "13781/200000",
+  "min_endpoints": {
+    "coolant_loss": "0/1",
+    "pump_fail": "0/1"
+  },
+  "max_endpoints": {
+    "coolant_loss": "1/20",
+    "pump_fail": "1/100"
+  },
+  "verdict": "uncertain"
+}
+```
+
+- 最小情形：两个区间事件都取下界 `0/1`，顶事件仅由 `motor_overheat` 贡献，得 `1/100`。
+- 最大情形：两个区间事件都取上界，
+  `1 − 99/100·(1 − 1/20)·(1 − 1/100) = 13781/200000 ≈ 0.0689`。
+- 阈值 `1/20 = 0.05` 落在区间 `[0.01, 0.0689]` 之内，故为 `uncertain`；把阈值提高到
+  `13781/200000`（等于 `max`）即返回 `safe`，降到小于 `1/100`（如 `99/10000`）即返回
+  `unsafe`。
+- 区间可以是退化的点区间（`low == high`，端点唯一）；已声明但未被顶层引用的区间事件
+  不影响最值，其并列端点按 `low` 优先输出。
+- **422**：`intervals` 的键不是已声明事件（门 id 也拒绝）、区间为空或超过 **8** 个、
+  `low`/`high` 不是合法 `n/d` 概率、`low > 原 p`、`high < 原 p` 或 `low > high`、`limit`
+  不是合法 `n/d` 概率；多项问题会在同一条 `detail` 中一并说明。故障树建图累计非终端
+  节点超过 **50000** 时同样返回 422（端点求值本身不新增节点）。
+
+非法区间的响应示例：
+
+```json
+{ "detail": "事件 'coolant_loss' 的区间上界 1/100 小于原概率 1/50，要求 原 p <= high" }
+```
+
 ## 输入格式
 
 | 字段 | 规则 |
@@ -961,6 +1054,8 @@ curl -s -X POST http://localhost:8000/v1/expand-model \
 | 模板名称（仅 `/v1/expand-model`） | 模板名、参数名、门名、实例名均须 ASCII 字母开头、后接字母/数字/下划线；同一模板内参数/门/实例名两两互异 |
 | `bindings`（仅 `/v1/expand-model`） | root 把根模板参数绑定到事件 id；子实例把被调模板参数绑定到父模板参数；键必须恰好覆盖被调模板全部参数 |
 | `root`（仅 `/v1/expand-model`） | 必填，含 `template`（已定义模板名）与 `bindings`；展开后门名为 `root[/实例 id …]/门名`，门总数不超过 **64** |
+| `intervals`（仅 `/v1/interval-risk`） | 必填，**1～8** 个已声明事件 id 到 `{low, high}` 的映射；`low`/`high` 均为合法 `n/d` 概率且 `low ≤ 原 p ≤ high`；区间事件概率在区间内独立变化，其余事件保持原 p |
+| `limit`（仅 `/v1/interval-risk`） | 必填，`n/d` 形式的合法概率；`max≤limit` 为 safe，`min>limit` 为 unsafe，其余为 uncertain |
 
 概率在节点上按 `P(node) = (1-p_v)·P(low) + p_v·P(high)` 自底向上精确传播；
 事件重要度通过“根到节点路径概率质量”单遍传播精确求得。
@@ -994,6 +1089,12 @@ curl -s -X POST http://localhost:8000/v1/expand-model \
 （至多 16 个观测）自底向上枚举合取：完全合取非零时直接返回空组列；否则利用零概率关于组的
 包含关系单调，跳过删单元素后已知零概率的超集，其余子集各经一次 `and_` 在共享唯一表上求值，
 为终端 0 即一个最小组，全程不枚举事件赋值。
+`/v1/interval-risk` 在故障树 ROBDD 上把顶事件概率化为 `k≤8` 个区间事件概率的多线性
+多项式（每个 BDD 节点维护至多 2^k 项的子集系数表：固定事件按先验做线性组合，区间事件
+按 `(1−t)·poly(low) + t·poly(high)` 展开；BDD 边跳过的区间变量天然不入多项式），再以
+逐变量代入的类 zeta 变换在 `O(k·2^k)` 次分数运算内求出全部 `2^k≤256` 个端点组合的取值，
+不枚举事件状态、不新增 BDD 节点；多线性函数在超盒上的最值必在端点组合取得，并列时按
+事件 id 字典序（位 0 为字典序最高位）、low 优先取唯一端点组合。
 
 ## 错误处理（HTTP 422）
 
@@ -1035,9 +1136,13 @@ curl -s -X POST http://localhost:8000/v1/expand-model \
   门输入或 `top` 引用未知本地节点、模板内门成环、模板间递归（含未被 root 触达的模板）、
   或展开后门总数超过 **64**；门数在模板调用图上记忆化限幅判定，不遍历实例树，
   故密集嵌套（如 8 层 × 每层 8 个同构子实例）也会瞬时返回 422，恰好 64 门仍可展开；
+- `/v1/interval-risk` 的 `intervals` 为空或超过 **8** 个、键不是已声明事件 id（门 id
+  同样拒绝）、某项的 `low`/`high` 不是合法 `n/d` 概率、`low > 原 p`、`high < 原 p` 或
+  `low > high`，或 `limit` 不是合法 `n/d` 概率（多项问题一并说明）；
 - ROBDD 构建过程中累计创建的非终端节点超过 **50000** 个
   （`/v1/analyze`、`/v1/repair-plan`、`/v1/diagnose`、`/v1/inspect-next`、
-  `/v1/likely-cause`、`/v1/failure-count`、`/v1/first-failure-time` 与
+  `/v1/likely-cause`、`/v1/failure-count`、`/v1/first-failure-time`、
+  `/v1/interval-risk` 与
   `/v1/observation-conflicts`；其中
   `/v1/diagnose`、`/v1/inspect-next`、`/v1/likely-cause` 还含合取观测约束与候选分支
   新增的节点，`/v1/failure-count` 的计数动态规划与 `/v1/first-failure-time` 的状态空间
@@ -1076,6 +1181,7 @@ app/
   repair.py    # 修复方案：ROBDD 上的受限赋值动态规划（成本/修复数/字典序）
   likely.py    # 最可能成因：ROBDD 上的最大先验乘积赋值动态规划（false 优先）
   first_hit.py # 首次故障时间：未触发状态上的整数公分母马尔可夫动态规划
+  intervals.py # 概率区间风险：顶事件概率的多线性多项式 + 2^k 端点精确求值
   main.py      # FastAPI 应用、请求模型与校验
 Dockerfile
 docker-compose.yml
@@ -1091,4 +1197,5 @@ tests/test_failure_count.py
 tests/test_first_failure_time.py
 tests/test_observation_conflicts.py
 tests/test_expand_model.py
+tests/test_interval_risk.py
 ```

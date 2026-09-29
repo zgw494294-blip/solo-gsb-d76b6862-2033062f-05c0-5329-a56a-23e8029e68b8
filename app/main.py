@@ -117,6 +117,22 @@ POST /v1/expand-model
   树），含根实例未触达模板在内的全部模板仍完成原有静态校验；事件与
   门的校验沿用 /v1/analyze 的规则。
 
+POST /v1/interval-risk
+  输入沿用 /v1/analyze 的 events、gates、top 校验；另收 intervals
+  （1~8 个事件 id 到 low、high 的映射）与阈值 limit，全部概率均为 n/d
+  字符串。要求 low <= 原 p <= high；未列入 intervals 的事件保持原 p，
+  区间事件概率可在各自 [low, high] 内独立变化，同一事件的重复引用共享
+  同一概率变量，NOT 门照常生效。
+  输出顶事件概率的 min_probability、max_probability，以及各自取得最值
+  时区间事件的端点取值（min/max_endpoints，按事件 id 字典序排列，值为
+  该事件取的 low 或 high，均为约分 n/d 字符串）：max_probability <=
+  limit 为 safe，min_probability > limit 为 unsafe，其余为 uncertain。
+  在故障树 ROBDD 上把顶事件概率化为区间事件的多线性多项式并对 2^k≤256
+  个端点组合精确求值，不枚举事件状态，也不新增 BDD 节点；最值并列时按
+  事件 id 字典序比较端点、low 优先。非法区间（id 未声明、low/high 不是
+  合法 n/d 概率、low > p 或 high < p 等）、非法阈值、或累计非终端节点
+  超过 50000 时返回 422 并说明原因。
+
 所有错误输入（未知引用、跨版引用、环、非法概率、节点超限等）统一返回 422。
 """
 
@@ -136,6 +152,7 @@ from .bdd import MAX_NONTERMINAL_NODES, NodeLimitExceeded, ROBDD
 from .conflicts import minimal_zero_prob_groups
 from .cutsets import compute_cut_set_families
 from .first_hit import first_failure_distribution, top_hit_masks
+from .intervals import probability_interval_extrema
 from .likely import most_likely_assignment
 from .repair import best_repair
 
@@ -388,6 +405,57 @@ class ObservationConflictsResponse(BaseModel):
         ...,
         description="全部最小零概率观测组：每组只列观测 id，组内按 id 排序，"
         "组间按长度及字典序排序；全部读数可同时成立时为空",
+    )
+
+
+class ProbabilityIntervalIn(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    low: str = Field(
+        ..., description="区间下界，n/d 形式，0<=low<=原 p<=high"
+    )
+    high: str = Field(
+        ..., description="区间上界，n/d 形式，low<=原 p<=high<=1"
+    )
+
+
+class IntervalRiskRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    events: List[EventIn] = Field(..., min_length=1, max_length=32)
+    gates: List[GateIn] = Field(default_factory=list, max_length=64)
+    top: str = Field(..., min_length=1, description="顶层节点 id（事件或门）")
+    intervals: Dict[str, ProbabilityIntervalIn] = Field(
+        ...,
+        min_length=1,
+        max_length=8,
+        description="1~8 个事件 id 到区间端点 {low, high}（均为 n/d）的映射",
+    )
+    limit: str = Field(
+        ..., description="风险判定阈值，n/d 形式的合法概率，0<=n<=d<=10^6"
+    )
+
+
+class IntervalRiskResponse(BaseModel):
+    min_probability: str = Field(
+        ..., description="区间事件概率独立变化时顶事件概率的最小值，约分 n/d"
+    )
+    max_probability: str = Field(
+        ..., description="区间事件概率独立变化时顶事件概率的最大值，约分 n/d"
+    )
+    min_endpoints: Dict[str, str] = Field(
+        ...,
+        description="取得最小值时各区间事件取的端点（low 或 high，约分 n/d），"
+        "按事件 id 字典序排列",
+    )
+    max_endpoints: Dict[str, str] = Field(
+        ...,
+        description="取得最大值时各区间事件取的端点（low 或 high，约分 n/d），"
+        "按事件 id 字典序排列",
+    )
+    verdict: Literal["safe", "unsafe", "uncertain"] = Field(
+        ...,
+        description="max<=limit 为 safe，min>limit 为 unsafe，其余为 uncertain",
     )
 
 
@@ -1286,9 +1354,105 @@ def observation_conflicts_logic(
     return ObservationConflictsResponse(conflicts=conflicts)
 
 
+def interval_risk_logic(payload: IntervalRiskRequest) -> IntervalRiskResponse:
+    probs, gate_ops, gate_inputs = _validate_payload(payload)
+
+    # ---- 阈值：合法 n/d 概率（规则同事件 p）----
+    limit = _parse_probability(payload.limit)
+
+    # ---- intervals：键必须是已声明事件（门 id 不允许）；端点为合法概率，
+    #       且 low <= 原 p <= high；多项问题一并返回 ----
+    interval_ids = sorted(payload.intervals)
+    unknown = [eid for eid in interval_ids if eid not in probs]
+    if unknown:
+        raise ValueError(
+            "intervals 引用了未声明的事件 id："
+            + ", ".join(repr(k) for k in unknown)
+        )
+
+    errors: List[str] = []
+    lows: Dict[str, Fraction] = {}
+    highs: Dict[str, Fraction] = {}
+    for eid in interval_ids:
+        spec = payload.intervals[eid]
+        try:
+            lo = _parse_probability(spec.low)
+        except ValueError as exc:
+            errors.append(f"事件 {eid!r} 的 intervals.low：{exc}")
+            lo = None  # type: ignore[assignment]
+        try:
+            hi = _parse_probability(spec.high)
+        except ValueError as exc:
+            errors.append(f"事件 {eid!r} 的 intervals.high：{exc}")
+            hi = None  # type: ignore[assignment]
+        if lo is not None and hi is not None:
+            p = probs[eid]
+            p_str = f"{p.numerator}/{p.denominator}"
+            if lo > p:
+                errors.append(
+                    f"事件 {eid!r} 的区间下界 {spec.low} 大于原概率 {p_str}，"
+                    "要求 low <= 原 p"
+                )
+            if hi < p:
+                errors.append(
+                    f"事件 {eid!r} 的区间上界 {spec.high} 小于原概率 {p_str}，"
+                    "要求 原 p <= high"
+                )
+            if lo > hi:
+                errors.append(
+                    f"事件 {eid!r} 的区间非法：low {spec.low} 大于 high {spec.high}"
+                )
+            lows[eid] = lo
+            highs[eid] = hi
+    if errors:
+        raise ValueError("；".join(errors))
+
+    # ---- 顶事件 ROBDD（沿用 50000 非终端节点限额）；区间端点求值不新增节点 ----
+    sorted_events, bdd, top_node, _ = build_tree_robdd(
+        probs, gate_ops, gate_inputs, payload.top
+    )
+    interval_var_index = [sorted_events.index(eid) for eid in interval_ids]
+    prob_list = [probs[eid] for eid in sorted_events]
+    low_list = [lows[eid] for eid in interval_ids]
+    high_list = [highs[eid] for eid in interval_ids]
+
+    min_prob, min_mask, max_prob, max_mask = probability_interval_extrema(
+        bdd,
+        top_node,
+        prob_list,
+        interval_var_index,
+        low_list,
+        high_list,
+    )
+
+    def frac_string(value: Fraction) -> str:
+        return f"{value.numerator}/{value.denominator}"
+
+    def endpoints(mask: int) -> Dict[str, str]:
+        # interval_ids 已按事件 id 字典序排列，第 i 位置位取 high，否则 low
+        return {
+            eid: frac_string(high_list[i] if mask >> i & 1 else low_list[i])
+            for i, eid in enumerate(interval_ids)
+        }
+
+    if max_prob <= limit:
+        verdict = "safe"
+    elif min_prob > limit:
+        verdict = "unsafe"
+    else:
+        verdict = "uncertain"
+
+    return IntervalRiskResponse(
+        min_probability=frac_string(min_prob),
+        max_probability=frac_string(max_prob),
+        min_endpoints=endpoints(min_mask),
+        max_endpoints=endpoints(max_mask),
+        verdict=verdict,
+    )
+
+
 # 展开后的扁平门数上限与 /v1/analyze 的 gates 上限一致
 MAX_EXPANDED_GATES = 64
-
 
 def _binding_cover_errors(
     bindings: Dict[str, str],
@@ -1770,4 +1934,16 @@ async def expand_model(payload: ExpandModelRequest) -> ExpandModelResponse:
     except ValueError as exc:
         # 事件/门非法、名称违规、绑定错误、未知引用、门环、模板递归、
         # 展开门数超过 64 等全部语义错误
+        return _bad_request(str(exc))  # type: ignore[return-value]
+
+
+@app.post("/v1/interval-risk", response_model=IntervalRiskResponse)
+async def interval_risk(payload: IntervalRiskRequest) -> IntervalRiskResponse:
+    try:
+        return interval_risk_logic(payload)
+    except NodeLimitExceeded as exc:
+        # 故障树建图累计非终端节点超过限制（区间端点求值不新增节点）
+        return _bad_request(str(exc))  # type: ignore[return-value]
+    except ValueError as exc:
+        # 未知引用、环、非法区间端点/阈值、id 未声明等全部语义错误
         return _bad_request(str(exc))  # type: ignore[return-value]
